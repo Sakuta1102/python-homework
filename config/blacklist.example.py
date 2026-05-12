@@ -1,19 +1,15 @@
 """
-反欺诈邮箱黑名单 / 合法邮箱白名单。
+合法邮箱白名单模板。
 
-⚠️ 真实业务规则不入仓库。
-- 复制本文件为 `blacklist.py`(已加入 .gitignore)
-- 由 IT/反欺诈团队提供实际词表
+⚠️ 部署时复制为 `config/blacklist.py`(已加入 .gitignore),由反欺诈团队
+   填入真实白名单。本文件只是占位,真实数据不入仓库。
 
-`config/projects.py` 在导入时会引用这两个列表。
+注意:黑产关键词 BLACKLIST_KEYWORDS 不在这里 —— 已切到飞书在线 sheet
+维护,服务启动时由 config/projects.py 通过 FEISHU_BLACKLIST_KEYWORDS_SHEET_ID
+拉取(见 .env.example)。
 """
-
-# 黑产关键词:命中即认定是高风险注册/找回邮箱
-BLACKLIST_KEYWORDS: list[str] = [
-    # "示例:把真实关键词填入 config/blacklist.py(本文件不要提交)"
-]
 
 # 合法邮箱域名:NOT LIKE 用,排除主流邮箱后剩下的视为可疑
 VIRTUAL_EMAIL_NOTLIKE: list[str] = [
-    # "@gmail.", "@yahoo.", ...  # 真实白名单填入 config/blacklist.py
+    # "@gmail.", "@yahoo.", ...
 ]

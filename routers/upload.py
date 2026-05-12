@@ -3,7 +3,7 @@ import os
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
-from config.blacklist import BLACKLIST_KEYWORDS
+from config.projects import fetch_blacklist_keywords
 from services.cleaner import load_dataframe
 from services.feishu import FeishuClient
 
@@ -63,7 +63,9 @@ async def blacklist_check(file: UploadFile = File(...)):
             ),
         )
 
-    keywords_lower = [kw.lower() for kw in BLACKLIST_KEYWORDS]
+    # 每次请求都从飞书 sheet 拉一次最新关键词
+    keywords = fetch_blacklist_keywords()
+    keywords_lower = [kw.lower() for kw in keywords]
     mask = df[column].apply(lambda v: _has_blacklist(v, keywords_lower))
     hits = df[mask]
     hit_count = int(mask.sum())

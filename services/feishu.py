@@ -105,8 +105,8 @@ class FeishuClient:
         spreadsheet_token, sheet_id = self._resolve_wiki_token(wiki_token, sheet_title)
         self.write_rows(spreadsheet_token, sheet_id, rows, start_row)
 
-    def _read_rows(self, spreadsheet_token: str, sheet_id: str, start_row: int = 1) -> list[list]:
-        """读取 sheet 现有内容，返回二维列表。"""
+    def read_rows(self, spreadsheet_token: str, sheet_id: str, start_row: int = 1) -> list[list]:
+        """读取 sheet 现有内容,返回二维列表(每行是 list,可能含 None / 字符串 / 数字)。"""
         range_str = f"{sheet_id}!A{start_row}:Z5000"
         url = f"{BASE_URL}/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{range_str}"
         with httpx.Client(headers=self._headers(), timeout=15) as client:
@@ -135,7 +135,7 @@ class FeishuClient:
         columns = list(rows[0].keys())
         new_block = [columns] + [[str(row.get(c, "")) for c in columns] for row in rows]
 
-        existing = self._read_rows(spreadsheet_token, sheet_id, start_row)
+        existing = self.read_rows(spreadsheet_token, sheet_id, start_row)
         if existing:
             num_cols = max(len(columns), max((len(r) for r in existing), default=0))
             combined = new_block + [[""] * num_cols] + existing

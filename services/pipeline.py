@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from dataclasses import dataclass
 
-from config.projects import PROJECTS, ProjectConfig
+from config.projects import get_projects, ProjectConfig
 from services.kyuubi import KyuubiClient
 from services.feishu import FeishuClient
 
@@ -20,10 +20,11 @@ class ProjectResult:
 def run_pipeline(start_date: date, end_date: date) -> list[ProjectResult]:
     kyuubi = KyuubiClient()
     feishu = FeishuClient()
+    projects = get_projects()  # 实时从飞书拉黑产关键词,组装最后 2 条 SQL
     with ThreadPoolExecutor(max_workers=_MAX_PARALLEL) as pool:
         futures = [
             pool.submit(_run_single, kyuubi, feishu, p, start_date, end_date)
-            for p in PROJECTS
+            for p in projects
         ]
         return [f.result() for f in futures]
 
