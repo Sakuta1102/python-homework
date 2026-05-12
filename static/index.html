@@ -79,6 +79,28 @@
     }
     .badge.ok    { background: #e6f9f0; color: #1a7f4b; }
     .badge.fail  { background: #fff0f0; color: #c0392b; }
+    .divider     { border-top: 1px solid #eef0f4; margin: 32px 0 24px; }
+    h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #1a1a2e; }
+    input[type="file"] {
+      width: 100%;
+      padding: 9px 12px;
+      border: 1px solid #d9dde8;
+      border-radius: 8px;
+      font-size: 13px;
+      background: #fafbfc;
+      margin-bottom: 14px;
+    }
+    #upload-status {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      display: none;
+      line-height: 1.5;
+    }
+    #upload-status.info  { background: #eef2ff; color: #3a58e0; }
+    #upload-status.ok    { background: #e6f9f0; color: #1a7f4b; }
+    #upload-status.error { background: #fff0f0; color: #c0392b; }
   </style>
 </head>
 <body>
@@ -100,6 +122,14 @@
 
   <div id="status"></div>
   <div id="detail-list"></div>
+
+  <div class="divider"></div>
+
+  <h2>玩家数据黑产检查</h2>
+  <label>上传 CSV / Excel / JSON,自动识别 form_new_email 列并写回飞书</label>
+  <input type="file" id="upload-file" accept=".csv,.xlsx,.xls,.json" />
+  <button id="check-btn" onclick="runBlacklistCheck()">检查并写入飞书</button>
+  <div id="upload-status"></div>
 </div>
 
 <script>
@@ -189,6 +219,52 @@
     el.textContent = msg;
     el.className = type;
     el.style.display = "block";
+  }
+
+  async function runBlacklistCheck() {
+    const fileInput = document.getElementById("upload-file");
+    const btn       = document.getElementById("check-btn");
+    const file      = fileInput.files[0];
+
+    if (!file) {
+      showUploadStatus("请选择文件", "error");
+      return;
+    }
+
+    btn.disabled = true;
+    showUploadStatus("正在上传并检查……", "info");
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const resp = await fetch("/upload/blacklist-check", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showUploadStatus(`失败:${data.detail || resp.statusText}`, "error");
+      } else {
+        const lines = [
+          data.message,
+          `匹配列:${data.column_used} · 文件:${data.filename}`,
+        ];
+        showUploadStatus(lines.join("\n"), data.hit_count > 0 ? "ok" : "info");
+      }
+    } catch (err) {
+      showUploadStatus(`网络错误:${err.message}`, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function showUploadStatus(msg, type) {
+    const el = document.getElementById("upload-status");
+    el.textContent = msg;
+    el.className = type;
+    el.style.display = "block";
+    el.style.whiteSpace = "pre-line";
   }
 
   function renderDetails(details) {
