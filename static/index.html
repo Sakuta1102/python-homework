@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>数据清洗自动化</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f7fa;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      padding: 48px 16px;
+    }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.08);
+      padding: 36px 40px;
+      width: 100%;
+      max-width: 520px;
+    }
+    h1 { font-size: 20px; font-weight: 600; margin-bottom: 24px; color: #1a1a2e; }
+    label { display: block; font-size: 13px; color: #555; margin-bottom: 6px; }
+    input[type="date"] {
+      width: 100%;
+      padding: 9px 12px;
+      border: 1px solid #d9dde8;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color .2s;
+    }
+    input[type="date"]:focus { border-color: #4f6ef7; }
+    .row { display: flex; gap: 16px; margin-bottom: 24px; }
+    .row > div { flex: 1; }
+    button {
+      width: 100%;
+      padding: 11px;
+      background: #4f6ef7;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background .2s, opacity .2s;
+    }
+    button:hover:not(:disabled) { background: #3a58e0; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    #status {
+      margin-top: 20px;
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      display: none;
+    }
+    #status.info  { background: #eef2ff; color: #3a58e0; }
+    #status.ok    { background: #e6f9f0; color: #1a7f4b; }
+    #status.error { background: #fff0f0; color: #c0392b; }
+    #detail-list  { margin-top: 16px; }
+    .detail-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 13px;
+    }
+    .detail-item:last-child { border-bottom: none; }
+    .badge {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .badge.ok    { background: #e6f9f0; color: #1a7f4b; }
+    .badge.fail  { background: #fff0f0; color: #c0392b; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>DataLeap → 飞书 自动数据清洗</h1>
+
+  <div class="row">
+    <div>
+      <label for="start_date">开始日期</label>
+      <input type="date" id="start_date" />
+    </div>
+    <div>
+      <label for="end_date">结束日期</label>
+      <input type="date" id="end_date" />
+    </div>
+  </div>
+
+  <button id="run-btn" onclick="runPipeline()">执行清洗</button>
+
+  <div id="status"></div>
+  <div id="detail-list"></div>
+</div>
+
+<script>
+  // 默认填上月 1 日 ~ 上月末
+  (function setDefaultDates() {
+    const now = new Date();
+    const firstOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const lastOfLastMonth   = new Date(firstOfThisMonth - 1);
+    const firstOfLastMonth  = new Date(lastOfLastMonth.getFullYear(), lastOfLastMonth.getMonth(), 1);
+    const fmt = d => d.toISOString().split("T")[0];
+    document.getElementById("start_date").value = fmt(firstOfLastMonth);
+    document.getElementById("end_date").value   = fmt(lastOfLastMonth);
+  })();
+
+  async function runPipeline() {
+    const startDate = document.getElementById("start_date").value;
+    const endDate   = document.getElementById("end_date").value;
+    const btn       = document.getElementById("run-btn");
+    const detailEl  = document.getElementById("detail-list");
+
+    if (!startDate || !endDate) {
+      showStatus("请选择完整的时间区间", "error");
+      return;
+    }
+    if (startDate > endDate) {
+      showStatus("结束日期不能早于开始日期", "error");
+      return;
+    }
+
+    btn.disabled = true;
+    detailEl.innerHTML = "";
+    showStatus("正在提交任务……", "info");
+
+    let jobId;
+    try {
+      const resp = await fetch("/pipeline/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ start_date: startDate, end_date: endDate }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showStatus(`请求失败：${data.detail || resp.statusText}`, "error");
+        btn.disabled = false;
+        return;
+      }
+      jobId = data.job_id;
+    } catch (err) {
+      showStatus(`网络错误：${err.message}`, "error");
+      btn.disabled = false;
+      return;
+    }
+
+    let dots = 0;
+    const timer = setInterval(async () => {
+      dots = (dots + 1) % 4;
+      showStatus("正在执行，请稍候" + ".".repeat(dots + 1), "info");
+      try {
+        const resp = await fetch(`/pipeline/status/${jobId}`);
+        if (resp.status === 404) {
+          clearInterval(timer);
+          btn.disabled = false;
+          showStatus("服务器已重启，任务丢失，请重新执行", "error");
+          return;
+        }
+        const job  = await resp.json();
+        if (job.status === "done") {
+          clearInterval(timer);
+          btn.disabled = false;
+          showStatus(job.message, job.success ? "ok" : "error");
+          renderDetails(job.details);
+        } else if (job.status === "error") {
+          clearInterval(timer);
+          btn.disabled = false;
+          showStatus(`执行出错：${job.message}`, "error");
+        }
+      } catch (err) {
+        clearInterval(timer);
+        btn.disabled = false;
+        showStatus(`轮询失败：${err.message}`, "error");
+      }
+    }, 5000);
+  }
+
+  function showStatus(msg, type) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = type;
+    el.style.display = "block";
+  }
+
+  function renderDetails(details) {
+    const el = document.getElementById("detail-list");
+    el.innerHTML = details.map(d => `
+      <div class="detail-item">
+        <span>${d.name}</span>
+        <span>
+          ${d.success
+            ? `<span class="badge ok">成功 · ${d.rows_written} 行</span>`
+            : `<span class="badge fail" title="${d.error}">失败</span>`}
+        </span>
+      </div>
+    `).join("");
+  }
+</script>
+</body>
+</html>

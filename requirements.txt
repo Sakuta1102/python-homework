@@ -1,0 +1,18 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pandas==2.2.2
+numpy==1.26.4
+pydantic==2.7.1
+python-multipart==0.0.9
+openpyxl==3.1.2
+chardet==5.2.0
+aiofiles>=23.2.1
+httpx>=0.27.0
+python-dotenv>=1.0.0
+
+# Kyuubi / Hive Thrift 客户端
+# Linux 部署前需先装 sasl 头文件:apt-get install -y libsasl2-dev
+pyhive[hive]>=0.7.0
+thrift>=0.16.0
+thrift_sasl>=0.4.3
+sasl>=0.3.1
