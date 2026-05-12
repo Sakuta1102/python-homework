@@ -25,11 +25,15 @@ def _resolve_column(columns, aliases):
     return None
 
 
-def _has_blacklist(value, keywords_lower):
+def _matched_keywords(value, keyword_pairs):
+    """返回值里命中的关键词原文(原大小写)的列表;无命中则空列表。
+
+    keyword_pairs: [(lower, original), ...]
+    """
     if pd.isna(value):
-        return False
+        return []
     s = str(value).lower()
-    return any(kw in s for kw in keywords_lower)
+    return [orig for low, orig in keyword_pairs if low in s]
 
 
 @router.post("/blacklist-check")
@@ -65,9 +69,12 @@ async def blacklist_check(file: UploadFile = File(...)):
 
     # 每次请求都从飞书 sheet 拉一次最新关键词
     keywords = fetch_blacklist_keywords()
-    keywords_lower = [kw.lower() for kw in keywords]
-    mask = df[column].apply(lambda v: _has_blacklist(v, keywords_lower))
-    hits = df[mask]
+    keyword_pairs = [(kw.lower(), kw) for kw in keywords]
+
+    matches_per_row = df[column].apply(lambda v: _matched_keywords(v, keyword_pairs))
+    mask = matches_per_row.apply(bool)
+    hits = df[mask].copy()
+    hits["命中关键词"] = matches_per_row[mask].apply(lambda lst: ", ".join(lst))
     hit_count = int(mask.sum())
 
     if hit_count > 0:
