@@ -10,6 +10,22 @@ except ImportError as exc:
     ) from exc
 
 
+def _cell_to_text(cell) -> str:
+    """飞书 sheet cell 可能是 str / list (富文本片段) / dict (合并单元格、超链接) / None,
+    统一压平为纯文本。避免 dict 序列化后包含 '{' / '}' 字符,污染下游 SQL 模板。"""
+    if cell is None:
+        return ""
+    if isinstance(cell, str):
+        return cell
+    if isinstance(cell, list):
+        # 富文本: [{"type": "text", "text": "..."}, ...]
+        return "".join(_cell_to_text(seg) for seg in cell)
+    if isinstance(cell, dict):
+        # 富文本片段 / 超链接 / 合并单元格
+        return str(cell.get("text", ""))
+    return str(cell)
+
+
 def fetch_blacklist_keywords() -> list[str]:
     """每次调用都从飞书电子表格指定 sheet(第一列)实时拉取黑产关键词。
 
@@ -19,6 +35,8 @@ def fetch_blacklist_keywords() -> list[str]:
 
     由 FEISHU_BLACKLIST_KEYWORDS_SHEET_ID 指定 sheet,从 FEISHU_SPREADSHEET_TOKEN
     指定的电子表格读取。第一行如果是表头("关键词" / "keyword" / 类似)会跳过。
+
+    cell 容错: 飞书富文本/合并单元格会返回 dict 或 list, 通过 _cell_to_text 压平。
     """
     sheet_id = os.getenv("FEISHU_BLACKLIST_KEYWORDS_SHEET_ID", "")
     spreadsheet_token = os.getenv("FEISHU_SPREADSHEET_TOKEN", "")
@@ -34,10 +52,7 @@ def fetch_blacklist_keywords() -> list[str]:
     for idx, row in enumerate(rows):
         if not row:
             continue
-        v = row[0]
-        if v is None or v == "":
-            continue
-        s = str(v).strip()
+        s = _cell_to_text(row[0]).strip()
         if not s:
             continue
         if idx == 0 and s.lower() in {a.lower() for a in header_aliases}:
@@ -197,9 +212,11 @@ def _not_like(field: str, patterns: list[str]) -> str:
 
 
 def _or_like(field: str, keywords: list[str]) -> str:
+    # 关键词里如果出现 '{' / '}' 会被下游 .format() 误判为占位符, 必须 escape
+    safe = [kw.replace("{", "{{").replace("}", "}}") for kw in keywords]
     lines = [
         f"    lower(get_json_object(event_datas, '$.{field}')) like '%{kw}%'"
-        for kw in keywords
+        for kw in safe
     ]
     return "AND (\n" + "\n    or ".join(lines) + "\n)"
 
