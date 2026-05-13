@@ -101,6 +101,17 @@
     #upload-status.info  { background: #eef2ff; color: #3a58e0; }
     #upload-status.ok    { background: #e6f9f0; color: #1a7f4b; }
     #upload-status.error { background: #fff0f0; color: #c0392b; }
+    #rebind-status {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      display: none;
+      line-height: 1.5;
+    }
+    #rebind-status.info  { background: #eef2ff; color: #3a58e0; }
+    #rebind-status.ok    { background: #e6f9f0; color: #1a7f4b; }
+    #rebind-status.error { background: #fff0f0; color: #c0392b; }
   </style>
 </head>
 <body>
@@ -130,6 +141,14 @@
   <input type="file" id="upload-file" accept=".csv,.xlsx,.xls,.json" />
   <button id="check-btn" onclick="runBlacklistCheck()">检查并写入飞书</button>
   <div id="upload-status"></div>
+
+  <div class="divider"></div>
+
+  <h2>换绑邮箱最新记录查询</h2>
+  <label>上传含 uid 列的 CSV / Excel,按 accountid 查最新一条换绑日志,给原表加一列 new_email 后写回飞书</label>
+  <input type="file" id="rebind-file" accept=".csv,.xlsx,.xls,.json" />
+  <button id="rebind-btn" onclick="runRebindLookup()">查询并写入飞书</button>
+  <div id="rebind-status"></div>
 </div>
 
 <script>
@@ -261,6 +280,52 @@
 
   function showUploadStatus(msg, type) {
     const el = document.getElementById("upload-status");
+    el.textContent = msg;
+    el.className = type;
+    el.style.display = "block";
+    el.style.whiteSpace = "pre-line";
+  }
+
+  async function runRebindLookup() {
+    const fileInput = document.getElementById("rebind-file");
+    const btn       = document.getElementById("rebind-btn");
+    const file      = fileInput.files[0];
+
+    if (!file) {
+      showRebindStatus("请选择文件", "error");
+      return;
+    }
+
+    btn.disabled = true;
+    showRebindStatus("正在上传并查询 Spark,可能需要 1-2 分钟……", "info");
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const resp = await fetch("/rebind-lookup/query", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showRebindStatus(`失败:${data.detail || resp.statusText}`, "error");
+      } else {
+        const lines = [
+          data.message,
+          `uid 列:${data.uid_column} · 文件:${data.filename}`,
+        ];
+        showRebindStatus(lines.join("\n"), data.matched_rows > 0 ? "ok" : "info");
+      }
+    } catch (err) {
+      showRebindStatus(`网络错误:${err.message}`, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function showRebindStatus(msg, type) {
+    const el = document.getElementById("rebind-status");
     el.textContent = msg;
     el.className = type;
     el.style.display = "block";

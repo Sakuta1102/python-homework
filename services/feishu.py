@@ -51,11 +51,8 @@ class FeishuClient:
             "Content-Type": "application/json",
         }
 
-    def _resolve_wiki_token(self, wiki_token: str, sheet_title: str = "") -> tuple[str, str]:
-        """
-        将知识库页面 token 解析为 (spreadsheet_token, sheet_id)。
-        sheet_title 为空时取第一个 sheet。
-        """
+    def _wiki_to_spreadsheet_token(self, wiki_token: str) -> str:
+        """从知识库页面 token 解析出底层电子表格的 spreadsheet_token。"""
         with httpx.Client(headers=self._headers(), timeout=15) as client:
             resp = client.get(
                 f"{BASE_URL}/open-apis/wiki/v2/spaces/get_node",
@@ -74,7 +71,14 @@ class FeishuClient:
                 "请确认链接指向的是电子表格而非文档"
             )
 
-        spreadsheet_token: str = node["obj_token"]
+        return node["obj_token"]
+
+    def _resolve_wiki_token(self, wiki_token: str, sheet_title: str = "") -> tuple[str, str]:
+        """
+        将知识库页面 token 解析为 (spreadsheet_token, sheet_id)。
+        sheet_title 为空时取第一个 sheet。
+        """
+        spreadsheet_token = self._wiki_to_spreadsheet_token(wiki_token)
 
         with httpx.Client(headers=self._headers(), timeout=15) as client:
             resp = client.get(
@@ -93,6 +97,21 @@ class FeishuClient:
             sheet_id = sheets[0]["sheet_id"]
 
         return spreadsheet_token, sheet_id
+
+    def write_to_wiki_sheet(
+        self,
+        wiki_token: str,
+        sheet_id: str,
+        rows: list[dict[str, Any]],
+        start_row: int = 1,
+    ) -> None:
+        """通过知识库 token + 已知 sheet_id 写入(免去 sheet 列表查询)。
+
+        飞书 wiki sheet URL 通常是 .../wiki/<wiki_token>?sheet=<sheet_id>，
+        把 URL 里的两段直接传进来即可。
+        """
+        spreadsheet_token = self._wiki_to_spreadsheet_token(wiki_token)
+        self.write_rows(spreadsheet_token, sheet_id, rows, start_row)
 
     def write_to_wiki(
         self,

@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from routers import clean
 from routers import pipeline
 from routers import upload
+from routers import rebind_lookup
 from routers.feishu_auth import router as feishu_auth_router
 
 app = FastAPI(
@@ -30,6 +31,7 @@ app.add_middleware(
 app.include_router(clean.router)
 app.include_router(pipeline.router)
 app.include_router(upload.router)
+app.include_router(rebind_lookup.router)
 app.include_router(feishu_auth_router)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
