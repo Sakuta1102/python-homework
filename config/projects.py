@@ -10,59 +10,27 @@ except ImportError as exc:
     ) from exc
 
 
-def _cell_to_text(cell) -> str:
-    """飞书 sheet cell 可能是 str / list (富文本片段) / dict (合并单元格、超链接) / None,
-    统一压平为纯文本。避免 dict 序列化后包含 '{' / '}' 字符,污染下游 SQL 模板。"""
-    if cell is None:
-        return ""
-    if isinstance(cell, str):
-        return cell
-    if isinstance(cell, list):
-        # 富文本: [{"type": "text", "text": "..."}, ...]
-        return "".join(_cell_to_text(seg) for seg in cell)
-    if isinstance(cell, dict):
-        # 富文本片段 / 超链接 / 合并单元格
-        return str(cell.get("text", ""))
-    return str(cell)
-
-
-def fetch_blacklist_keywords() -> list[str]:
-    """每次调用都从飞书电子表格指定 sheet(第一列)实时拉取黑产关键词。
-
-    不缓存:词表只在飞书在线维护,运营改完保存,服务下一次执行就用新词表
-    (无需重启)。代价是每次 pipeline / upload 多一次 ~300ms 的飞书 API
-    调用,可以接受。
-
-    由 FEISHU_BLACKLIST_KEYWORDS_SHEET_ID 指定 sheet,从 FEISHU_SPREADSHEET_TOKEN
-    指定的电子表格读取。第一行如果是表头("关键词" / "keyword" / 类似)会跳过。
-
-    cell 容错: 飞书富文本/合并单元格会返回 dict 或 list, 通过 _cell_to_text 压平。
-    """
-    sheet_id = os.getenv("FEISHU_BLACKLIST_KEYWORDS_SHEET_ID", "")
-    spreadsheet_token = os.getenv("FEISHU_SPREADSHEET_TOKEN", "")
-    if not sheet_id or not spreadsheet_token:
-        raise RuntimeError(
-            "缺少 FEISHU_SPREADSHEET_TOKEN 或 FEISHU_BLACKLIST_KEYWORDS_SHEET_ID env。"
-            "黑产关键词从飞书 sheet 第一列读取,这两个变量必须配置。"
-        )
-    from services.feishu import FeishuClient
-    rows = FeishuClient().read_rows(spreadsheet_token, sheet_id)
-    keywords: list[str] = []
-    header_aliases = {"关键词", "keyword", "黑产关键词", "邮箱关键词"}
-    for idx, row in enumerate(rows):
-        if not row:
-            continue
-        s = _cell_to_text(row[0]).strip()
-        if not s:
-            continue
-        if idx == 0 and s.lower() in {a.lower() for a in header_aliases}:
-            continue
-        keywords.append(s)
-    if not keywords:
-        raise RuntimeError(
-            f"飞书 sheet {sheet_id} 第一列没读到任何关键词,请检查 sheet 内容与权限。"
-        )
-    return keywords
+# ── 黑产关键词 (写死在代码里, 跟仓库一起部署) ───────────────────────────────
+# 仅用于 routers/upload.py 的纯 Python 过滤; 数据清洗 SQL 里的 LIKE 链是另写在
+# _SQL_BLACKLIST_EMAIL / _SQL_BLACKLIST_NEW_EMAIL 中的(用户重新贴 SQL 时直接覆盖
+# 那两个常量)。改词时记得两边同步,否则上传查询和数据清洗筛选会不一致。
+BLACKLIST_KEYWORDS: list[str] = [
+    "accfresh", "acc", "account", "admin", "akun", "akunml", "buy", "claim",
+    "codashop", "code", "collector", "confirm", "csmlbb", "csmobile", "csmoonton",
+    "custom", "dadun", "diamond", "donotreply", "dunski", "dunsky", "dunsqi",
+    "evostv", "evylysn", "free", "freesourcecodes", "fresh", "freshml", "gufum",
+    "gusion", "hack", "hacker", "help", "ibenkscr", "invoice", "kode", "kuccing",
+    "limit", "midman", "ml", "mlbb", "mlbbcs", "mobileleg", "mobilelegend",
+    "mobilelelegend", "moontod", "moonton", "pack", "payment", "recover", "redeem",
+    "register", "retrieve", "rixx", "sell", "server", "service", "shop", "skin",
+    "spinjela", "stevarazu", "stevenfebriyan", "stock", "stockgamer", "stok",
+    "stolml", "store", "sukacash", "tohru.org", "unban", "unpak", "untukhb",
+    "vaylyn", "verifi", "verify", "ganteng", "bns", "chou", "xvier", "kof",
+    "hxh", "hunter", "onic", "@hi2.in", "clashofclans", "prize", "narruto",
+    "vonsy", "moskov", "check", "moderator", "anjing", "metrozero", "hok",
+    "dias", "sultan", "granger", "stox", "Bengkel", "banget", "gameshub.id",
+    "active", "deltajohnsons.com", "customer",
+]
 
 
 @dataclass
@@ -176,7 +144,7 @@ ON aa.form_new_email = bb.form_new_email
 """
 
 
-# ── 共用平铺 SELECT 基础（查询6-8，无 CTE）────────────────────────────────────
+# ── 共用平铺 SELECT 基础（查询6:虚拟邮箱）────────────────────────────────────
 
 _SQL_FLAT_BASE = """
 SELECT  logymd,
@@ -211,21 +179,300 @@ def _not_like(field: str, patterns: list[str]) -> str:
     )
 
 
-def _or_like(field: str, keywords: list[str]) -> str:
-    # 关键词里如果出现 '{' / '}' 会被下游 .format() 误判为占位符, 必须 escape
-    safe = [kw.replace("{", "{{").replace("}", "}}") for kw in keywords]
-    lines = [
-        f"    lower(get_json_object(event_datas, '$.{field}')) like '%{kw}%'"
-        for kw in safe
-    ]
-    return "AND (\n" + "\n    or ".join(lines) + "\n)"
-
-
 # ── 查询6:虚拟邮箱白名单 ────────────────────────────────────────────────────
-# 黑/白名单词表分两路:VIRTUAL_EMAIL_NOTLIKE 在 config/blacklist.py(gitignored);
-# BLACKLIST_KEYWORDS 在飞书 sheet 实时维护,见 fetch_blacklist_keywords()。
 
 _SQL_VIRTUAL_EMAIL = _SQL_FLAT_BASE + _not_like("form_email", VIRTUAL_EMAIL_NOTLIKE)
+
+
+# ── 查询7-8: 黑产关键词筛选 (SQL 写死在代码里, 直接发给 Kyuubi) ────────────────
+# 关键词改动:用户重新贴 SQL → 直接覆盖下面两个常量。
+# 配套的 BLACKLIST_KEYWORDS 列表(在 config/blacklist.py)只给 routers/upload.py
+# 的纯 Python 过滤用,改 SQL 时记得同步那个列表。
+
+_SQL_BLACKLIST_EMAIL = """
+SELECT  logymd,
+        roleid,
+        get_json_object(event_datas, '$.target_account_id') AS lost_acc_id,
+        get_json_object(event_datas, '$.target_zone_id') AS lost_acc_server,
+        lower(get_json_object(event_datas, '$.form_email')) AS form_email,
+        lower(get_json_object(event_datas, '$.form_new_email')) AS form_new_email,
+        get_json_object(event_datas, '$.source_device_id') AS device_id,
+        lower(get_json_object(event_datas, '$.source_region')) AS source_region,
+        lower(get_json_object(event_datas, '$.target_account_create_region')) AS target_account_create_region,
+        get_json_object(event_datas, '$.shark_appeal_id') AS shark_appeal_id
+FROM    (
+            SELECT  replace(
+                        replace(replace(event_data, '\\\\x', "temp"), '\\\\\\\\', '\\\\'),
+                        "recv.mt_account_bind_email",
+                        "mt_account_bind_email"
+                    ) AS event_datas,
+                    logymd,
+                    roleid,
+                    zoneid,
+                    act_type,
+                    TIME
+            FROM    mtwb_ods.php_events
+            WHERE   act_type = "elva"
+            AND     logymd BETWEEN '{start_date}' AND '{end_date}'
+        ) a
+WHERE   (
+            get_json_object(event_datas, '$.mlbb_game_response_data') = '{{"result":"0"}}'
+             OR get_json_object(event_datas, '$.mt_account_bind_email') = '{{"result":"0"}}'
+        )
+AND     act_type = "elva"
+AND     get_json_object(event_datas, '$.form_email') != ""
+AND     get_json_object(event_datas, '$.form_new_email') != ""
+AND     (
+            lower(get_json_object (event_datas, '$.form_email')) LIKE "%accfresh%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%acc%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%account%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%admin%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%akun%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%akunml%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%buy%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%claim%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%codashop%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%code%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%collector%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%confirm%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%csmlbb%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%csmobile%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%csmoonton%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%custom%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%dadun%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%diamond%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%donotreply%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%dunski%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%dunsky%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%dunsqi%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%evostv%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%evylysn%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%free%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%freesourcecodes%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%fresh%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%freshml%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%gufum%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%gusion%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%hack%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%hacker%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%help%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%ibenkscr%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%invoice%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%kode%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%kuccing%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%limit%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%midman%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%ml%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%mlbb%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%mlbbcs%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%mobileleg%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%mobilelegend%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%mobilelelegend%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%moontod%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%moonton%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%pack%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%payment%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%recover%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%redeem%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%register%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%retrieve%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%rixx%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%sell%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%server%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%service%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%shop%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%skin%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%spinjela%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stevarazu%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stevenfebriyan%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stock%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stockgamer%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stok%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stolml%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%store%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%sukacash%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%tohru.org%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%unban%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%unpak%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%untukhb%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%vaylyn%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%verifi%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%verify%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%ganteng%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%bns%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%chou%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%xvier%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%kof%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%hxh%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%hunter%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%onic%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%@hi2.in%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%clashofclans%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%prize%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%narruto%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%vonsy%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%moskov%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%check%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%moderator%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%anjing%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%metrozero%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%hok%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%dias%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%sultan%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%granger%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%stox%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%Bengkel%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%banget%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%gameshub.id%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%active%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%deltajohnsons.com%"
+            or lower(get_json_object (event_datas, '$.form_email')) like "%customer%"
+        )
+"""
+
+
+_SQL_BLACKLIST_NEW_EMAIL = """
+SELECT  logymd,
+        roleid,
+        get_json_object(event_datas, '$.target_account_id') AS lost_acc_id,
+        get_json_object(event_datas, '$.target_zone_id') AS lost_acc_server,
+        lower(get_json_object(event_datas, '$.form_email')) AS form_email,
+        lower(get_json_object(event_datas, '$.form_new_email')) AS form_new_email,
+        get_json_object(event_datas, '$.source_device_id') AS device_id,
+        lower(get_json_object(event_datas, '$.source_region')) AS source_region,
+        lower(get_json_object(event_datas, '$.target_account_create_region')) AS target_account_create_region,
+        get_json_object(event_datas, '$.shark_appeal_id') AS shark_appeal_id
+FROM    (
+            SELECT  replace(
+                        replace(replace(event_data, '\\\\x', "temp"), '\\\\\\\\', '\\\\'),
+                        "recv.mt_account_bind_email",
+                        "mt_account_bind_email"
+                    ) AS event_datas,
+                    logymd,
+                    roleid,
+                    zoneid,
+                    act_type,
+                    TIME
+            FROM    mtwb_ods.php_events
+            WHERE   act_type = "elva"
+            AND     logymd BETWEEN '{start_date}' AND '{end_date}'
+        ) a
+WHERE   (
+            get_json_object(event_datas, '$.mlbb_game_response_data') = '{{"result":"0"}}'
+            OR get_json_object(event_datas, '$.mt_account_bind_email') = '{{"result":"0"}}'
+        )
+AND     act_type = "elva"
+AND     get_json_object(event_datas, '$.form_email') != ""
+AND     get_json_object(event_datas, '$.form_new_email') != ""
+AND     (
+            lower(get_json_object (event_datas, '$.form_new_email')) LIKE "%accfresh%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%acc%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%account%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%admin%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%akun%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%akunml%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%buy%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%claim%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%codashop%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%code%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%collector%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%confirm%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%csmlbb%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%csmobile%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%csmoonton%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%custom%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%dadun%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%diamond%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%donotreply%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%dunski%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%dunsky%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%dunsqi%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%evostv%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%evylysn%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%free%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%freesourcecodes%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%fresh%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%freshml%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%gufum%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%gusion%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%hack%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%hacker%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%help%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%ibenkscr%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%invoice%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%kode%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%kuccing%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%limit%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%midman%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%ml%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%mlbb%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%mlbbcs%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%mobileleg%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%mobilelegend%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%mobilelelegend%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%moontod%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%moonton%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%pack%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%payment%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%recover%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%redeem%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%register%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%retrieve%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%rixx%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%sell%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%server%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%service%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%shop%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%skin%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%spinjela%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stevarazu%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stevenfebriyan%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stock%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stockgamer%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stok%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stolml%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%store%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%sukacash%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%tohru.org%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%unban%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%unpak%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%untukhb%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%vaylyn%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%verifi%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%verify%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%ganteng%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%bns%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%chou%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%xvier%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%kof%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%hxh%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%hunter%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%onic%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%@hi2.in%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%clashofclans%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%prize%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%narruto%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%vonsy%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%moskov%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%check%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%moderator%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%anjing%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%metrozero%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%hok%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%dias%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%sultan%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%granger%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%stox%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%Bengkel%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%banget%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%gameshub.id%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%active%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%deltajohnsons.com%"
+            or lower(get_json_object (event_datas, '$.form_new_email')) like "%customer%"
+        )
+ORDER BY
+        get_json_object(event_datas, '$.form_new_email')
+"""
 
 
 # ── 项目列表 ─────────────────────────────────────────────────────────────────
@@ -233,8 +480,7 @@ _SQL_VIRTUAL_EMAIL = _SQL_FLAT_BASE + _not_like("form_email", VIRTUAL_EMAIL_NOTL
 _SPREADSHEET_TOKEN = os.getenv("FEISHU_SPREADSHEET_TOKEN", "")
 _WIKI_TOKEN = os.getenv("FEISHU_WIKI_TOKEN", "")
 
-# 不依赖飞书黑名单的 6 个固定项目,模块加载时构建一次即可
-_BASE_PROJECTS: list[ProjectConfig] = [
+PROJECTS: list[ProjectConfig] = [
     ProjectConfig(
         name="来单uid找回多个账号",
         feishu_wiki_token=_WIKI_TOKEN,
@@ -277,35 +523,18 @@ _BASE_PROJECTS: list[ProjectConfig] = [
         feishu_spreadsheet_token=_SPREADSHEET_TOKEN,
         feishu_sheet_id="FsZa3k",
     ),
+    ProjectConfig(
+        name="form_email黑产",
+        feishu_wiki_token=_WIKI_TOKEN,
+        sql_template=_SQL_BLACKLIST_EMAIL,
+        feishu_spreadsheet_token=_SPREADSHEET_TOKEN,
+        feishu_sheet_id="bVm3JG",
+    ),
+    ProjectConfig(
+        name="form_new_email黑产",
+        feishu_wiki_token=_WIKI_TOKEN,
+        sql_template=_SQL_BLACKLIST_NEW_EMAIL,
+        feishu_spreadsheet_token=_SPREADSHEET_TOKEN,
+        feishu_sheet_id="Q2OkrM",
+    ),
 ]
-
-
-def get_projects() -> list[ProjectConfig]:
-    """返回完整的 8 个项目配置;调用时实时从飞书拉黑产关键词,组装最后两条 SQL。
-
-    供 services/pipeline.run_pipeline 调用。每次 pipeline 触发都会重新拉关键词,
-    保证用的是飞书 sheet 当前状态。
-    """
-    keywords = fetch_blacklist_keywords()
-    sql_blacklist = _SQL_FLAT_BASE + _or_like("form_email", keywords)
-    sql_blacklist_new = (
-        _SQL_FLAT_BASE
-        + _or_like("form_new_email", keywords)
-        + "\nORDER BY lower(get_json_object(event_datas, '$.form_new_email'))"
-    )
-    return _BASE_PROJECTS + [
-        ProjectConfig(
-            name="form_email黑产",
-            feishu_wiki_token=_WIKI_TOKEN,
-            sql_template=sql_blacklist,
-            feishu_spreadsheet_token=_SPREADSHEET_TOKEN,
-            feishu_sheet_id="bVm3JG",
-        ),
-        ProjectConfig(
-            name="form_new_email黑产",
-            feishu_wiki_token=_WIKI_TOKEN,
-            sql_template=sql_blacklist_new,
-            feishu_spreadsheet_token=_SPREADSHEET_TOKEN,
-            feishu_sheet_id="Q2OkrM",
-        ),
-    ]
